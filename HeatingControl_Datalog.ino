@@ -23,7 +23,7 @@
 #include <SD.h>
 #include <Wire.h>
 #include "RTClib.h"                // DS3231 RTC library
-#include "Adafruit_SHTC3.h"        // SHTC3 temperature/humidity sensor library
+#include "SparkFun_SHTC3.h"        // More memory-efficient SHTC3 library
 
 // ========== PIN DEFINITIONS ==========
 #define CS_PIN 10                  // SD card chip select pin (from Datalogger branch)
@@ -32,14 +32,14 @@
 
 // ========== SYSTEM PARAMETERS ==========
 // Temperature setpoint: system will heat when temperature drops below this value
-float SETPOINT = 25.0;            // Target temperature (°C)
+const float SETPOINT = 25.0;      // Target temperature (°C)
 
 // Heating control timings
-long HTIME = 30000;               // Heating duration per cycle (30 seconds in milliseconds)
-long WAIT_AFTER = 120000;         // Rest/cooling duration after heating (2 minutes in milliseconds)
+const long HTIME = 30000;         // Heating duration per cycle (30 seconds in milliseconds)
+const long WAIT_AFTER = 120000;   // Rest/cooling duration after heating (2 minutes in milliseconds)
 
 // Data logging interval: total time between each cycle start
-long LOG_INTERVAL = 300000;       // Total cycle interval (5 minutes in milliseconds)
+const long LOG_INTERVAL = 300000; // Total cycle interval (5 minutes in milliseconds)
 
 // Sensor error tracking
 int sensor_error_count = 0;       // Counter for consecutive sensor read failures
@@ -47,14 +47,14 @@ const int MAX_ERROR_ATTEMPTS = 3; // Maximum consecutive errors before logging f
 
 // ========== PERIPHERAL OBJECT INITIALIZATION ==========
 RTC_DS3231 rtc;                   // Real-Time Clock object
-Adafruit_SHTC3 shtc3 = Adafruit_SHTC3();  // SHTC3 sensor object
+SHTC3 shtc3;                      // SHTC3 sensor object (SparkFun library)
 File dataFile;                    // SD card file object for data logging
 
 // ========== SETUP FUNCTION ==========
 // Runs once when Arduino powered on or reset
 void setup() {
   // Initialize serial communication for debugging output
-  Serial.begin(9600);
+  Serial.begin(4800);  // Reduced baud rate to save memory
   
   // Initialize I2C communication for RTC and SHTC3 sensors
   Wire.begin();
@@ -65,44 +65,42 @@ void setup() {
 
   // ========== INITIALIZE RTC ==========
   if (!rtc.begin()) {
-    Serial.println("ERROR: No RTC found! Check I2C connections.");
-    while (1);  // Halt if RTC not detected
+    Serial.println(F("RTC fail"));
+    while (1);
   }
-  Serial.println("RTC initialized successfully.");
+  Serial.println(F("RTC OK"));
 
   // ========== INITIALIZE SD CARD ==========
   if (!SD.begin(CS_PIN)) {
-    Serial.println("ERROR: SD card initialization failed! Check CS pin and connections.");
-    while (1);  // Halt if SD card not detected
+    Serial.println(F("SD fail"));
+    while (1);
   }
-  Serial.println("SD card initialized successfully.");
+  Serial.println(F("SD OK"));
 
   // ========== INITIALIZE SHTC3 SENSOR ==========
-  if (!shtc3.begin()) {
-    Serial.println("ERROR: SHTC3 sensor not found! Check I2C connections.");
-    while (1);  // Halt if SHTC3 not detected
+  if (shtc3.begin() != SHTC3_Status_Nominal) {
+    Serial.println(F("SHTC3 fail"));
+    while (1);
   }
-  Serial.println("SHTC3 sensor initialized successfully.");
+  Serial.println(F("SHTC3 OK"));
 
   // ========== CREATE CSV HEADER ==========
   // Check if datalog file already exists; if not, create it with header row
   if (!SD.exists("datalog.csv")) {
     dataFile = SD.open("datalog.csv", FILE_WRITE);
     if (dataFile) {
-      // CSV header: Time and sensor data with action taken
-      dataFile.println("Hour:Minute:Second,Temperature(C),Humidity(%),Action");
+      dataFile.println(F("Hour:Minute:Second,Temperature(C),Humidity(%),Action"));
       dataFile.close();
-      Serial.println("Created new datalog.csv with header.");
+      Serial.println(F("CSV created"));
     } else {
-      Serial.println("ERROR: Could not create datalog.csv!");
-      while (1);  // Halt if CSV creation fails
+      Serial.println(F("CSV error"));
+      while (1);
     }
   } else {
-    Serial.println("Using existing datalog.csv file.");
+    Serial.println(F("Using existing CSV"));
   }
 
-  Serial.println("Setup complete. Starting heat control system...");
-  Serial.println("---");
+  Serial.println(F("Setup complete."));
 }
 
 // ========== MAIN LOOP ==========
@@ -113,47 +111,35 @@ void loop() {
 
   // ========== SENSOR READING ==========
   // Attempt to read temperature and humidity from SHTC3 sensor
-  sensors_event_t humidity, temp;
-  shtc3.getEvent(&humidity, &temp);
-
-  float temperature = temp.temperature;
-  float humidity_value = humidity.relative_humidity;
-
-  // ========== ERROR CHECKING ==========
-  // Check if sensor reading is valid (isnan = "is not a number")
-  if (isnan(temperature) || isnan(humidity_value)) {
+  if (shtc3.update() != SHTC3_Status_Nominal) {
     sensor_error_count++;
-    Serial.print("WARNING: Sensor read failed (attempt ");
-    Serial.print(sensor_error_count);
-    Serial.println(")");
+    Serial.print(F("Sensor error "));
+    Serial.println(sensor_error_count);
     
     // Log sensor failure to CSV
-    logToSD(now, NAN, NAN, "SENSOR_ERROR");
+    logToSD(now, NAN, NAN, "ERROR");
     
     // If sensor fails too many times, halt the system
     if (sensor_error_count >= MAX_ERROR_ATTEMPTS) {
-      Serial.println("CRITICAL: Sensor failures exceeded max attempts. System paused.");
-      // Wait before retrying (prevents rapid error spam)
+      Serial.println(F("Sensor fail - paused"));
       delay(LOG_INTERVAL);
-      sensor_error_count = 0;  // Reset counter after long wait
+      sensor_error_count = 0;
       return;
     }
-    return;  // Skip heating cycle and try again next iteration
+    return;
   }
+
+  float temperature = shtc3.toDegC();
+  float humidity_value = shtc3.toPercent();
 
   // Reset error counter on successful read
   sensor_error_count = 0;
 
-  // ========== LOG INITIAL STATE ==========
-  // Record the current temperature/humidity before any heating action
-  logToSD(now, temperature, humidity_value, "CYCLE_START");
-
   // ========== HEATING DECISION LOGIC ==========
   // Check if current temperature is below setpoint
   if (temperature < SETPOINT) {
-    Serial.print("Temperature ");
-    Serial.print(temperature);
-    Serial.println("C is below setpoint. Activating heater...");
+    Serial.print(F("Heat ON: "));
+    Serial.println(temperature);
 
     // Turn on relay (LOW = active)
     digitalWrite(RELAY_PIN, LOW);
@@ -161,28 +147,25 @@ void loop() {
 
     // Turn off relay after heating time (HIGH = inactive)
     digitalWrite(RELAY_PIN, HIGH);
-    Serial.println("Heating complete. Starting cooling rest period...");
+    Serial.println(F("Heat OFF"));
 
     // Log heating action
-    logToSD(now, temperature, humidity_value, "HEATING_ACTIVE");
+    logToSD(now, temperature, humidity_value, "HEAT_ON");
 
     // Wait for cooling/rest period
     delay(WAIT_AFTER);
 
   } else {
     // Temperature is above setpoint, no heating needed
-    Serial.print("Temperature ");
-    Serial.print(temperature);
-    Serial.println("C is at or above setpoint. Skipping heating.");
+    Serial.print(F("OK: "));
+    Serial.println(temperature);
     
     // Log that heating was not needed
-    logToSD(now, temperature, humidity_value, "HEATING_SKIP");
+    logToSD(now, temperature, humidity_value, "OK");
   }
 
   // ========== CYCLE COMPLETION ==========
-  // Wait for remainder of LOG_INTERVAL to complete the cycle
-  // (total cycle time = heating + rest + logging)
-  Serial.println("Cycle complete. Waiting for next interval...");
+  Serial.println(F("Cycle done"));
   delay(LOG_INTERVAL);
 }
 
@@ -196,9 +179,9 @@ void loop() {
  *   DateTime n  - Current date/time from RTC
  *   float t     - Temperature reading (°C) or NAN if sensor error
  *   float h     - Humidity reading (%) or NAN if sensor error
- *   String act  - Description of action taken (e.g., "HEATING_ACTIVE", "SENSOR_ERROR")
+ *   const char* act  - Description of action taken (e.g., "HEATING_ACTIVE", "SENSOR_ERROR")
  */
-void logToSD(DateTime n, float t, float h, String act) {
+void logToSD(DateTime n, float t, float h, const char* act) {
   // Attempt to open CSV file in append mode
   dataFile = SD.open("datalog.csv", FILE_WRITE);
 
@@ -241,15 +224,15 @@ void logToSD(DateTime n, float t, float h, String act) {
 
     // ========== SERIAL OUTPUT FOR DEBUGGING ==========
     // Mirror the logged data to Serial monitor for live monitoring
-    Serial.print("LOGGED: ");
+    Serial.print(F("LOG: "));
     if (!isnan(t)) {
       Serial.print(t);
-      Serial.print("C - ");
+      Serial.print(F("C "));
     }
     Serial.println(act);
 
   } else {
     // If file open fails, report error via serial
-    Serial.println("ERROR: Could not open datalog.csv for writing!");
+    Serial.println(F("Log error"));
   }
 }
