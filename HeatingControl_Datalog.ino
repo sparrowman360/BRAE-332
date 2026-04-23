@@ -1,7 +1,7 @@
 /*
  * BRAE-332: Heat Control System with Data Logging
  * ================================================
- * This program controls a heating system using an active-low relay and logs
+ * This program controls a heating system using an active-HIGH relay and logs
  * temperature/humidity data from an SHTC3 sensor to an SD card via CSV.
  * 
  * Hardware:
@@ -9,7 +9,7 @@
  * - DS3231 Real-Time Clock (RTC) via I2C
  * - SHTC3 Temperature/Humidity Sensor via I2C
  * - SD Card Module (CS pin 10, SPI interface)
- * - Relay module (active low: LOW = ON, HIGH = OFF)
+ * - Relay module (active high: HIGH = ON, LOW = OFF)
  * 
  * Cycle Operation:
  * 1. Check current temperature against setpoint
@@ -27,8 +27,7 @@
 
 // ========== PIN DEFINITIONS ==========
 #define CS_PIN 10                  // SD card chip select pin (from Datalogger branch)
-#define RELAY_PIN 7                // TODO: CHANGE THIS PIN - Active low relay control pin -- changed to pin 7
-                                   // (HIGH = relay OFF, LOW = relay ON)
+#define RELAY_PIN 7                // Relay control pin -- active HIGH: HIGH = relay ON, LOW = relay OFF
 
 // ========== SYSTEM PARAMETERS ==========
 // Temperature setpoint: system will heat when temperature drops below this value
@@ -50,6 +49,21 @@ RTC_DS3231 rtc;                   // Real-Time Clock object
 SHTC3 shtc3;                      // SHTC3 sensor object (SparkFun library)
 File dataFile;                    // SD card file object for data logging
 
+// ========== HELPER FUNCTIONS ==========
+void printTimestamp(Print &out, const DateTime &n) {
+  out.print(n.year());
+  out.print(",");
+  out.print(n.month());
+  out.print(",");
+  out.print(n.day());
+  out.print(",");
+  out.print(n.hour());
+  out.print(",");
+  out.print(n.minute());
+  out.print(",");
+  out.print(n.second());
+}
+
 // ========== SETUP FUNCTION ==========
 // Runs once when Arduino powered on or reset
 void setup() {
@@ -59,9 +73,9 @@ void setup() {
   // Initialize I2C communication for RTC and SHTC3 sensors
   Wire.begin();
 
-  // Initialize relay pin as output and set to HIGH (relay OFF - active low)
+  // Initialize relay pin as output and set to LOW (relay OFF - active HIGH)
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);  // Ensure relay is OFF at startup
+  digitalWrite(RELAY_PIN, LOW);  // Ensure relay is OFF at startup
 
   // ========== INITIALIZE RTC ==========
   if (!rtc.begin()) {
@@ -89,7 +103,7 @@ void setup() {
   if (!SD.exists("datalog.csv")) {
     dataFile = SD.open("datalog.csv", FILE_WRITE);
     if (dataFile) {
-      dataFile.println(F("Hour:Minute:Second,Temperature(C),Humidity(%),Action"));
+      dataFile.println(F("Year,Month,Day,Hour,Minute,Second,Temperature(C),Humidity(%),Action"));
       dataFile.close();
       Serial.println(F("CSV created"));
     } else {
@@ -111,29 +125,42 @@ void loop() {
 
   // ========== SENSOR READING ==========
   // Attempt to read temperature and humidity from SHTC3 sensor
-  if (shtc3.update() != SHTC3_Status_Nominal) {
-    sensor_error_count++;
-    Serial.print(F("Sensor error "));
-    Serial.println(sensor_error_count);
-    
-    // Log sensor failure to CSV
-    logToSD(now, NAN, NAN, "ERROR");
-    
-    // If sensor fails too many times, halt the system
-    if (sensor_error_count >= MAX_ERROR_ATTEMPTS) {
-      Serial.println(F("Sensor fail - paused"));
-      delay(LOG_INTERVAL);
-      sensor_error_count = 0;
+  int sensorStatus = shtc3.update();
+  if (sensorStatus != SHTC3_Status_Nominal) {
+    Serial.print(F("Sensor read failed, status="));
+    Serial.println(sensorStatus);
+
+    for (int attempt = 1; attempt < MAX_ERROR_ATTEMPTS && sensorStatus != SHTC3_Status_Nominal; attempt++) {
+      delay(200);
+      sensorStatus = shtc3.update();
+      Serial.print(F("Retry "));
+      Serial.print(attempt);
+      Serial.print(F(" status="));
+      Serial.println(sensorStatus);
+    }
+
+    if (sensorStatus != SHTC3_Status_Nominal) {
+      sensor_error_count++;
+      Serial.print(F("Sensor error "));
+      Serial.println(sensor_error_count);
+
+      // Log sensor failure to CSV
+      logToSD(now, NAN, NAN, "ERROR");
+
+      // If sensor fails too many times, pause between cycles and reset the counter
+      if (sensor_error_count >= MAX_ERROR_ATTEMPTS) {
+        Serial.println(F("Sensor fail - paused"));
+        delay(LOG_INTERVAL);
+        sensor_error_count = 0;
+      }
       return;
     }
-    return;
   }
 
+  // Successful read resets consecutive failure count
+  sensor_error_count = 0;
   float temperature = shtc3.toDegC();
   float humidity_value = shtc3.toPercent();
-
-  // Reset error counter on successful read
-  sensor_error_count = 0;
 
   // ========== HEATING DECISION LOGIC ==========
   // Check if current temperature is below setpoint
@@ -141,12 +168,12 @@ void loop() {
     Serial.print(F("Heat ON: "));
     Serial.println(temperature);
 
-    // Turn on relay (LOW = active)
-    digitalWrite(RELAY_PIN, LOW);
+    // Turn on relay (HIGH = active)
+    digitalWrite(RELAY_PIN, HIGH);
     delay(HTIME);
 
-    // Turn off relay after heating time (HIGH = inactive)
-    digitalWrite(RELAY_PIN, HIGH);
+    // Turn off relay after heating time (LOW = inactive)
+    digitalWrite(RELAY_PIN, LOW);
     Serial.println(F("Heat OFF"));
 
     // Log heating action
@@ -187,16 +214,8 @@ void logToSD(DateTime n, float t, float h, const char* act) {
 
   if (dataFile) {
     // ========== WRITE TIMESTAMP ==========
-    // Format: HH:MM:SS
-    dataFile.print(n.hour());
-    dataFile.print(":");
-    // Pad single-digit minutes with leading zero
-    if (n.minute() < 10) dataFile.print("0");
-    dataFile.print(n.minute());
-    dataFile.print(":");
-    // Pad single-digit seconds with leading zero
-    if (n.second() < 10) dataFile.print("0");
-    dataFile.print(n.second());
+    // Format: Year,Month,Day,Hour,Minute,Second
+    printTimestamp(dataFile, n);
     dataFile.print(",");
 
     // ========== WRITE SENSOR VALUES ==========
