@@ -27,14 +27,19 @@
 
 // ========== PIN DEFINITIONS ==========
 #define CS_PIN 10                  // SD card chip select pin (from Datalogger branch)
-#define RELAY_PIN 7                // Relay control pin -- active HIGH: HIGH = relay ON, LOW = relay OFF
+#define RELAY_PIN 7                // Relay control pin
+
+// Relay logic: set to true for active-HIGH modules, false for active-LOW modules
+const bool RELAY_ACTIVE_HIGH = true;
+const int RELAY_ON = RELAY_ACTIVE_HIGH ? HIGH : LOW;
+const int RELAY_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
 
 // ========== SYSTEM PARAMETERS ==========
 // Temperature setpoint: system will heat when temperature drops below this value
 const float SETPOINT = 25.0;      // Target temperature (°C)
 
 // Heating control timings
-const long HTIME = 30000;         // Heating duration per cycle (30 seconds in milliseconds)
+const long HTIME = 60000;         // Heating duration per cycle (60 seconds in milliseconds)
 const long WAIT_AFTER = 120000;   // Rest/cooling duration after heating (2 minutes in milliseconds)
 
 // Data logging interval: total time between each cycle start
@@ -50,6 +55,12 @@ SHTC3 shtc3;                      // SHTC3 sensor object (SparkFun library)
 File dataFile;                    // SD card file object for data logging
 
 // ========== HELPER FUNCTIONS ==========
+void setRelay(bool on) {
+  digitalWrite(RELAY_PIN, on ? RELAY_ON : RELAY_OFF);
+  Serial.print(F("Relay -> "));
+  Serial.println(on ? F("ON") : F("OFF"));
+}
+
 void printTimestamp(Print &out, const DateTime &n) {
   out.print(n.year());
   out.print(",");
@@ -73,9 +84,9 @@ void setup() {
   // Initialize I2C communication for RTC and SHTC3 sensors
   Wire.begin();
 
-  // Initialize relay pin as output and set to LOW (relay OFF - active HIGH)
+  // Initialize relay pin as output and set to inactive state on startup
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);  // Ensure relay is OFF at startup
+  setRelay(false);
 
   // ========== INITIALIZE RTC ==========
   if (!rtc.begin()) {
@@ -168,19 +179,27 @@ void loop() {
     Serial.print(F("Heat ON: "));
     Serial.println(temperature);
 
-    // Turn on relay (HIGH = active)
-    digitalWrite(RELAY_PIN, HIGH);
+    // Turn on relay for heating
+    setRelay(true);
     delay(HTIME);
 
-    // Turn off relay after heating time (LOW = inactive)
-    digitalWrite(RELAY_PIN, LOW);
+    // Turn off relay after heating time
+    setRelay(false);
     Serial.println(F("Heat OFF"));
 
-    // Log heating action
-    logToSD(now, temperature, humidity_value, "HEAT_ON");
+    // Log completed heating cycle
+    logToSD(now, temperature, humidity_value, "HEAT_CYCLE");
 
     // Wait for cooling/rest period
     delay(WAIT_AFTER);
+
+    // Delay the remaining cycle time so total loop duration equals LOG_INTERVAL
+    long remainingDelay = LOG_INTERVAL - HTIME - WAIT_AFTER;
+    if (remainingDelay > 0) {
+      delay(remainingDelay);
+    } else if (remainingDelay < 0) {
+      Serial.println(F("WARNING: LOG_INTERVAL shorter than HTIME + WAIT_AFTER"));
+    }
 
   } else {
     // Temperature is above setpoint, no heating needed
