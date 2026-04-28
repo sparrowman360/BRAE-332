@@ -39,7 +39,7 @@ const int RELAY_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
 const float SETPOINT = 25.0;      // Target temperature (°C)
 
 // Heating control timings
-const long HTIME = 60000;         // Heating duration per cycle (60 seconds in milliseconds)
+const long HTIME = 120000;         // Heating duration per cycle (60 seconds in milliseconds)
 const long WAIT_AFTER = 120000;   // Rest/cooling duration after heating (2 minutes in milliseconds)
 
 // Data logging interval: total time between each cycle start
