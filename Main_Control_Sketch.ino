@@ -29,9 +29,9 @@
 // ========== PIN DEFINITIONS ==========
 #define CS_PIN 10                  // SD card chip select pin (from Datalogger branch)
 #define HEATING_PIN 7              // Heating relay control pin
-#define LIGHT_PIN 8                // Light relay control pin (TBD)
-#define FAN_PIN 9                  // Fan relay control pin (TBD)
-#define PUMP_PIN 10                // Pump relay control pin (TBD - note: conflicts with CS_PIN, adjust as needed)
+#define LIGHT_PIN 9                // Light relay control pin (TBD)
+#define FAN_PIN 8                  // Fan relay control pin 
+#define PUMP_PIN 6                // Pump relay control pin 
 
 // Relay logic: set to true for active-HIGH modules, false for active-LOW modules
 const bool RELAY_ACTIVE_HIGH = true;
