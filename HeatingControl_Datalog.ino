@@ -24,15 +24,19 @@
 #include <Wire.h>
 #include "RTClib.h"                // DS3231 RTC library
 #include "SparkFun_SHTC3.h"        // More memory-efficient SHTC3 library
+#include <TaskScheduler.h>         // Task Scheduler library for non-blocking timing
 
 // ========== PIN DEFINITIONS ==========
 #define CS_PIN 10                  // SD card chip select pin (from Datalogger branch)
-#define RELAY_PIN 7                // Relay control pin
+#define HEATING_PIN 7              // Heating relay control pin
+#define LIGHT_PIN 8                // Light relay control pin (TBD)
+#define FAN_PIN 9                  // Fan relay control pin (TBD)
+#define PUMP_PIN 10                // Pump relay control pin (TBD - note: conflicts with CS_PIN, adjust as needed)
 
 // Relay logic: set to true for active-HIGH modules, false for active-LOW modules
 const bool RELAY_ACTIVE_HIGH = true;
-const int RELAY_ON = RELAY_ACTIVE_HIGH ? HIGH : LOW;
-const int RELAY_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
+const int HEATING_ON = RELAY_ACTIVE_HIGH ? HIGH : LOW;
+const int HEATING_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
 
 // ========== SYSTEM PARAMETERS ==========
 // Temperature setpoint: system will heat when temperature drops below this value
@@ -48,16 +52,48 @@ const long LOG_INTERVAL = 300000; // Total cycle interval (5 minutes in millisec
 // Sensor error tracking
 int sensor_error_count = 0;       // Counter for consecutive sensor read failures
 const int MAX_ERROR_ATTEMPTS = 3; // Maximum consecutive errors before logging failure
+int retryAttempt = 0;             // Current retry attempt for sensor reading
+
+// Global variables for current cycle data (used by tasks)
+DateTime currentNow;
+float currentTemp;
+float currentHumidity;
 
 // ========== PERIPHERAL OBJECT INITIALIZATION ==========
 RTC_DS3231 rtc;                   // Real-Time Clock object
 SHTC3 shtc3;                      // SHTC3 sensor object (SparkFun library)
 File dataFile;                    // SD card file object for data logging
+Scheduler ts;                     // Task Scheduler for non-blocking operations
+
+// ========== TASK OBJECTS ==========
+Task tRunCycle(0, TASK_FOREVER, &runCycle, &ts, false);
+Task tTurnOff(0, TASK_ONCE, &turnOffRelay, &ts, false);
+Task tLogHeat(0, TASK_ONCE, &logHeatCycle, &ts, false);
+Task tReEnable(0, TASK_ONCE, &reEnableCycle, &ts, false);
+Task tSensorRetry(0, TASK_ONCE, &sensorRetry, &ts, false);
 
 // ========== HELPER FUNCTIONS ==========
-void setRelay(bool on) {
-  digitalWrite(RELAY_PIN, on ? RELAY_ON : RELAY_OFF);
+void setHeatingRelay(bool on) {
+  digitalWrite(HEATING_PIN, on ? HEATING_ON : HEATING_OFF);
   Serial.print(F("Relay -> "));
+  Serial.println(on ? F("ON") : F("OFF"));
+}
+
+void setLight(bool on) {
+  digitalWrite(LIGHT_PIN, on ? HIGH : LOW);  // Assume active-HIGH; adjust if needed
+  Serial.print(F("Light -> "));
+  Serial.println(on ? F("ON") : F("OFF"));
+}
+
+void setFan(bool on) {
+  digitalWrite(FAN_PIN, on ? HIGH : LOW);  // Assume active-HIGH; adjust if needed
+  Serial.print(F("Fan -> "));
+  Serial.println(on ? F("ON") : F("OFF"));
+}
+
+void setPump(bool on) {
+  digitalWrite(PUMP_PIN, on ? HIGH : LOW);  // Assume active-HIGH; adjust if needed
+  Serial.print(F("Pump -> "));
   Serial.println(on ? F("ON") : F("OFF"));
 }
 
@@ -75,6 +111,104 @@ void printTimestamp(Print &out, const DateTime &n) {
   out.print(n.second());
 }
 
+// ========== TASK FUNCTIONS FOR SCHEDULER ==========
+void turnOffRelay() {
+  setHeatingRelay(false);
+  Serial.println(F("Heat OFF"));
+}
+
+void logHeatCycle() {
+  logToSD(currentNow, currentTemp, currentHumidity, "HEAT_CYCLE");
+}
+
+void reEnableCycle() {
+  ts.enableTask(tRunCycle);
+  sensor_error_count = 0;
+  Serial.println(F("Cycle resumed after sensor pause"));
+}
+
+void processSensorData() {
+  // ========== HEATING DECISION LOGIC ==========
+  // Check if current temperature is below setpoint
+  if (currentTemp < SETPOINT) {
+    Serial.print(F("Heat ON: "));
+    Serial.println(currentTemp);
+
+    // Turn on relay for heating
+    setHeatingRelay(true);
+
+    // Schedule to turn off relay after HTIME
+    ts.enableDelayedTask(tTurnOff, HTIME);
+
+    // Schedule to log heat cycle after HTIME + WAIT_AFTER
+    ts.enableDelayedTask(tLogHeat, HTIME + WAIT_AFTER);
+
+  } else {
+    // Temperature is above setpoint, no heating needed
+    Serial.print(F("OK: "));
+    Serial.println(currentTemp);
+    
+    // Log that heating was not needed
+    logToSD(currentNow, currentTemp, currentHumidity, "OK");
+  }
+
+  // ========== CYCLE COMPLETION ==========
+  Serial.println(F("Cycle done"));
+}
+
+void sensorRetry() {
+  int sensorStatus = shtc3.update();
+  Serial.print(F("Retry "));
+  Serial.print(retryAttempt);
+  Serial.print(F(" status="));
+  Serial.println(sensorStatus);
+
+  if (sensorStatus == SHTC3_Status_Nominal) {
+    // Success
+    sensor_error_count = 0;
+    currentTemp = shtc3.toDegC();
+    currentHumidity = shtc3.toPercent();
+    processSensorData();
+  } else if (retryAttempt >= MAX_ERROR_ATTEMPTS) {
+    // Max retries reached
+    sensor_error_count++;
+    Serial.print(F("Sensor error "));
+    Serial.println(sensor_error_count);
+    logToSD(currentNow, NAN, NAN, "ERROR");
+
+    if (sensor_error_count >= MAX_ERROR_ATTEMPTS) {
+      Serial.println(F("Sensor fail - paused"));
+      ts.disableTask(tRunCycle);
+      ts.enableDelayedTask(tReEnable, LOG_INTERVAL);
+    }
+  } else {
+    // Retry again
+    retryAttempt++;
+    ts.enableDelayedTask(tSensorRetry, 200);
+  }
+}
+void runCycle() {
+  // Get current date/time from RTC
+  currentNow = rtc.now();
+
+  // ========== SENSOR READING ==========
+  // Attempt to read temperature and humidity from SHTC3 sensor
+  int sensorStatus = shtc3.update();
+  if (sensorStatus != SHTC3_Status_Nominal) {
+    Serial.print(F("Sensor read failed, status="));
+    Serial.println(sensorStatus);
+    retryAttempt = 1;
+    ts.enableDelayedTask(tSensorRetry, 200);
+    return;
+  }
+
+  // Successful read
+  sensor_error_count = 0;
+  currentTemp = shtc3.toDegC();
+  currentHumidity = shtc3.toPercent();
+  processSensorData();
+}
+
 // ========== SETUP FUNCTION ==========
 // Runs once when Arduino powered on or reset
 void setup() {
@@ -85,8 +219,16 @@ void setup() {
   Wire.begin();
 
   // Initialize relay pin as output and set to inactive state on startup
-  pinMode(RELAY_PIN, OUTPUT);
-  setRelay(false);
+  pinMode(HEATING_PIN, OUTPUT);
+  setHeatingRelay(false);
+
+  // Initialize additional relay pins (TBD - set to inactive)
+  pinMode(LIGHT_PIN, OUTPUT);
+  setLight(false);
+  pinMode(FAN_PIN, OUTPUT);
+  setFan(false);
+  pinMode(PUMP_PIN, OUTPUT);
+  setPump(false);
 
   // ========== INITIALIZE RTC ==========
   if (!rtc.begin()) {
@@ -126,93 +268,20 @@ void setup() {
   }
 
   Serial.println(F("Setup complete."));
+
+  // ========== SETUP TASK SCHEDULER ==========
+  ts.addTask(tRunCycle);
+  ts.addTask(tTurnOff);
+  ts.addTask(tLogHeat);
+  ts.addTask(tReEnable);
+  ts.addTask(tSensorRetry);
+  ts.enablePeriodicTask(tRunCycle, LOG_INTERVAL);
 }
 
 // ========== MAIN LOOP ==========
-// Runs repeatedly at each cycle interval
+// Runs repeatedly to execute scheduled tasks
 void loop() {
-  // Get current date/time from RTC
-  DateTime now = rtc.now();
-
-  // ========== SENSOR READING ==========
-  // Attempt to read temperature and humidity from SHTC3 sensor
-  int sensorStatus = shtc3.update();
-  if (sensorStatus != SHTC3_Status_Nominal) {
-    Serial.print(F("Sensor read failed, status="));
-    Serial.println(sensorStatus);
-
-    for (int attempt = 1; attempt < MAX_ERROR_ATTEMPTS && sensorStatus != SHTC3_Status_Nominal; attempt++) {
-      delay(200);
-      sensorStatus = shtc3.update();
-      Serial.print(F("Retry "));
-      Serial.print(attempt);
-      Serial.print(F(" status="));
-      Serial.println(sensorStatus);
-    }
-
-    if (sensorStatus != SHTC3_Status_Nominal) {
-      sensor_error_count++;
-      Serial.print(F("Sensor error "));
-      Serial.println(sensor_error_count);
-
-      // Log sensor failure to CSV
-      logToSD(now, NAN, NAN, "ERROR");
-
-      // If sensor fails too many times, pause between cycles and reset the counter
-      if (sensor_error_count >= MAX_ERROR_ATTEMPTS) {
-        Serial.println(F("Sensor fail - paused"));
-        delay(LOG_INTERVAL);
-        sensor_error_count = 0;
-      }
-      return;
-    }
-  }
-
-  // Successful read resets consecutive failure count
-  sensor_error_count = 0;
-  float temperature = shtc3.toDegC();
-  float humidity_value = shtc3.toPercent();
-
-  // ========== HEATING DECISION LOGIC ==========
-  // Check if current temperature is below setpoint
-  if (temperature < SETPOINT) {
-    Serial.print(F("Heat ON: "));
-    Serial.println(temperature);
-
-    // Turn on relay for heating
-    setRelay(true);
-    delay(HTIME);
-
-    // Turn off relay after heating time
-    setRelay(false);
-    Serial.println(F("Heat OFF"));
-
-    // Log completed heating cycle
-    logToSD(now, temperature, humidity_value, "HEAT_CYCLE");
-
-    // Wait for cooling/rest period
-    delay(WAIT_AFTER);
-
-    // Delay the remaining cycle time so total loop duration equals LOG_INTERVAL
-    long remainingDelay = LOG_INTERVAL - HTIME - WAIT_AFTER;
-    if (remainingDelay > 0) {
-      delay(remainingDelay);
-    } else if (remainingDelay < 0) {
-      Serial.println(F("WARNING: LOG_INTERVAL shorter than HTIME + WAIT_AFTER"));
-    }
-
-  } else {
-    // Temperature is above setpoint, no heating needed
-    Serial.print(F("OK: "));
-    Serial.println(temperature);
-    
-    // Log that heating was not needed
-    logToSD(now, temperature, humidity_value, "OK");
-  }
-
-  // ========== CYCLE COMPLETION ==========
-  Serial.println(F("Cycle done"));
-  delay(LOG_INTERVAL);
+  ts.execute();
 }
 
 // ========== DATA LOGGING FUNCTION ==========
