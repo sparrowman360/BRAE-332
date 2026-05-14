@@ -25,6 +25,7 @@
 #define CS_PIN 10                  // SD card chip select pin
 #define HEATING_PIN 7              // Heating pad relay control pin
 #define PUMP_PIN 6                 // Evaporative cooler pump relay control pin
+#define FAN_PIN 8                  // Fan relay control pin
 
 // Relay logic: set to true for active-HIGH modules, false for active-LOW modules
 const bool RELAY_ACTIVE_HIGH = true;
@@ -67,6 +68,12 @@ void setHeatingRelay(bool on) {
 void setPump(bool on) {
   digitalWrite(PUMP_PIN, on ? PUMP_ON : PUMP_OFF);
   Serial.print(F("Pump -> "));
+  Serial.println(on ? F("ON") : F("OFF"));
+}
+
+void setFan(bool on) {
+  digitalWrite(FAN_PIN, on ? HIGH : LOW);
+  Serial.print(F("Fan -> "));
   Serial.println(on ? F("ON") : F("OFF"));
 }
 
@@ -164,26 +171,15 @@ void sampleAndUpdateState() {
       phase = PHASE_COOLING;
       setHeatingRelay(false);
       setPump(true);
+      setFan(true);
       lowestTempObserved = currentTemp;
       coolingStableCount = 0;
       Serial.println(F("Target reached. Switching to COOLING."));
     }
     logToSD(currentNow, currentTemp, currentHumidity, "HEATING");
   } else if (phase == PHASE_COOLING) {
-    if (currentTemp < lowestTempObserved - 0.05) {
-      lowestTempObserved = currentTemp;
-      coolingStableCount = 0;
-    } else if (currentTemp > lowestTempObserved + COOLING_STABLE_THRESHOLD) {
-      coolingStableCount++;
-    }
-
+    // Pump and fan run indefinitely while logging continues
     logToSD(currentNow, currentTemp, currentHumidity, "COOLING");
-
-    if (coolingStableCount >= STABLE_COUNT_REQUIRED) {
-      setPump(false);
-      phase = PHASE_COMPLETE;
-      Serial.println(F("Cooling complete. Pump stopped."));
-    }
   } else {
     logToSD(currentNow, currentTemp, currentHumidity, "COOLING");
   }
@@ -195,8 +191,10 @@ void setup() {
 
   pinMode(HEATING_PIN, OUTPUT);
   pinMode(PUMP_PIN, OUTPUT);
+  pinMode(FAN_PIN, OUTPUT);
   setHeatingRelay(false);
   setPump(false);
+  setFan(false);
 
   if (!rtc.begin()) {
     Serial.println(F("RTC fail"));
