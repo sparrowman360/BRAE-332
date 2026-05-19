@@ -39,8 +39,16 @@ const int HEATING_ON = RELAY_ACTIVE_HIGH ? HIGH : LOW;
 const int HEATING_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
 
 // ========== SYSTEM PARAMETERS ==========
-const float HEATING_SETPOINT = 25.0;      // Heating threshold (°C)
-const float COOLING_SETPOINT = 27.0;      // Cooling threshold (°C)
+const float HEATING_SETPOINT = 25.0;      // Heating target midpoint (°C)
+const float COOLING_SETPOINT = 27.0;      // Cooling target midpoint (°C)
+
+// Hysteresis band definitions
+//   Heating:  ON when <= HEATING_ON_POINT, OFF above HEATING_OFF_POINT
+//   Cooling:  ON when >= COOLING_ON_POINT, OFF below COOLING_OFF_POINT
+const float HEATING_ON_POINT = 23.0;      // Heating ON threshold (°C)
+const float HEATING_OFF_POINT = 25.0;     // Heating OFF threshold (°C)
+const float COOLING_ON_POINT = 27.5;      // Cooling ON threshold (°C)
+const float COOLING_OFF_POINT = 27.0;     // Cooling OFF threshold (°C)
 
 // Heating control timings
 const long HTIME = 120000;                // Heating duration per cycle (120 seconds in milliseconds)
@@ -81,14 +89,25 @@ SHTC3 shtc3;                      // SHTC3 sensor object (SparkFun library)
 File dataFile;                    // SD card file object for data logging
 Scheduler ts;                     // Task Scheduler for non-blocking operations
 
+// ========== TASK CALLBACK PROTOTYPES ==========
+void runCycle();
+void turnOffRelay();
+void heatWaitComplete();
+void turnOffCooling();
+void coolWaitComplete();
+void logPeriodic();
+void sensorRetry();
+void reEnableCycle();
+
 // ========== TASK OBJECTS ==========
-Task tRunCycle(0, TASK_FOREVER, &runCycle, &ts, false);
-Task tHeatOff(0, TASK_ONCE, &turnOffRelay, &ts, false);
-Task tHeatWait(0, TASK_ONCE, &heatWaitComplete, &ts, false);
-Task tCoolOff(0, TASK_ONCE, &turnOffCooling, &ts, false);
-Task tCoolWait(0, TASK_ONCE, &coolWaitComplete, &ts, false);
-Task tLogPeriodic(0, TASK_FOREVER, &logPeriodic, &ts, false);
-Task tSensorRetry(0, TASK_ONCE, &sensorRetry, &ts, false);
+Task tRunCycle(SENSOR_CHECK_INTERVAL, TASK_FOREVER, &runCycle, &ts, false);
+Task tHeatOff(HTIME, TASK_ONCE, &turnOffRelay, &ts, false);
+Task tHeatWait(WAIT_AFTER, TASK_ONCE, &heatWaitComplete, &ts, false);
+Task tCoolOff(COOL_TIME, TASK_ONCE, &turnOffCooling, &ts, false);
+Task tCoolWait(COOL_WAIT_AFTER, TASK_ONCE, &coolWaitComplete, &ts, false);
+Task tLogPeriodic(LOG_INTERVAL, TASK_FOREVER, &logPeriodic, &ts, false);
+Task tSensorRetry(200, TASK_ONCE, &sensorRetry, &ts, false);
+Task tReEnable(LOG_INTERVAL, TASK_ONCE, &reEnableCycle, &ts, false);
 
 // ========== HELPER FUNCTIONS ==========
 void setHeatingRelay(bool on) {
@@ -116,25 +135,39 @@ void setPump(bool on) {
 }
 
 void startHeatingCycle() {
+  if (currentTemp > HEATING_ON_POINT) {
+    Serial.print(F("Heating suppressed by hysteresis: "));
+    Serial.print(currentTemp);
+    Serial.print(F(" > "));
+    Serial.println(HEATING_ON_POINT);
+    return;
+  }
+
   heatingActive = true;
   heatingWait = false;
   setHeatingRelay(true);
   setPump(false);
   setFan(false);
   Serial.println(F("Heating cycle started."));
-  ts.enableDelayedTask(tHeatOff, HTIME);
-  ts.enableDelayedTask(tHeatWait, HTIME + WAIT_AFTER);
+  tHeatOff.restart();
 }
 
 void startCoolingCycle() {
+  if (currentTemp < COOLING_ON_POINT) {
+    Serial.print(F("Cooling suppressed by hysteresis: "));
+    Serial.print(currentTemp);
+    Serial.print(F(" < "));
+    Serial.println(COOLING_ON_POINT);
+    return;
+  }
+
   coolingActive = true;
   coolingWait = false;
   setHeatingRelay(false);
   setPump(true);
   setFan(true);
   Serial.println(F("Cooling cycle started."));
-  ts.enableDelayedTask(tCoolOff, COOL_TIME);
-  ts.enableDelayedTask(tCoolWait, COOL_TIME + COOL_WAIT_AFTER);
+  tCoolOff.restart();
 }
 
 void turnOffCooling() {
@@ -143,6 +176,7 @@ void turnOffCooling() {
   coolingActive = false;
   coolingWait = true;
   Serial.println(F("Cooling ON time complete, entering cooling rest."));
+  tCoolWait.restart();
 }
 
 void heatWaitComplete() {
@@ -227,10 +261,11 @@ void turnOffRelay() {
   heatingActive = false;
   heatingWait = true;
   Serial.println(F("Heat OFF"));
+  tHeatWait.restart();
 }
 
 void reEnableCycle() {
-  ts.enableTask(tRunCycle);
+  tRunCycle.restart();
   sensor_error_count = 0;
   Serial.println(F("Cycle resumed after sensor pause"));
 }
@@ -243,12 +278,12 @@ void processSensorData() {
     return;
   }
 
-  if (currentTemp < HEATING_SETPOINT) {
+  if (currentTemp <= HEATING_ON_POINT) {
     Serial.print(F("Heat ON: "));
     Serial.println(currentTemp);
     startHeatingCycle();
     logToSD(currentNow, currentTemp, currentHumidity, "HEATING_ON");
-  } else if (currentTemp > COOLING_SETPOINT) {
+  } else if (currentTemp >= COOLING_ON_POINT) {
     Serial.print(F("Cooling ON: "));
     Serial.println(currentTemp);
     startCoolingCycle();
@@ -285,13 +320,13 @@ void sensorRetry() {
 
     if (sensor_error_count >= MAX_ERROR_ATTEMPTS) {
       Serial.println(F("Sensor fail - paused"));
-      ts.disableTask(tRunCycle);
-      ts.enableDelayedTask(tReEnable, LOG_INTERVAL);
+      tRunCycle.disable();
+      tReEnable.enable();
     }
   } else {
     // Retry again
     retryAttempt++;
-    ts.enableDelayedTask(tSensorRetry, 200);
+    tSensorRetry.restart();
   }
 }
 void runCycle() {
@@ -306,7 +341,7 @@ void runCycle() {
     Serial.print(F("Sensor read failed, status="));
     Serial.println(sensorStatus);
     retryAttempt = 1;
-    ts.enableDelayedTask(tSensorRetry, 200);
+    tSensorRetry.restart();
     return;
   }
 
@@ -387,8 +422,10 @@ void setup() {
   ts.addTask(tCoolWait);
   ts.addTask(tLogPeriodic);
   ts.addTask(tSensorRetry);
-  ts.enablePeriodicTask(tRunCycle, SENSOR_CHECK_INTERVAL);
-  ts.enablePeriodicTask(tLogPeriodic, LOG_INTERVAL);
+  ts.addTask(tReEnable);
+
+  tRunCycle.restart();
+  tLogPeriodic.restart();
 }
 
 // ========== MAIN LOOP ==========
