@@ -35,7 +35,7 @@ const int PUMP_ON = HIGH;          // Assume pump relay is active HIGH
 const int PUMP_OFF = LOW;
 
 // Process control parameters
-const float HEATING_TARGET_TEMP = 30.0;          // °C
+const float HEATING_TARGET_TEMP = 27.0;          // °C
 const unsigned long SAMPLE_INTERVAL = 10000UL;   // Data sample interval in milliseconds
 const int STABLE_COUNT_REQUIRED = 3;             // Number of upward/warming samples to stop cooling
 const float COOLING_STABLE_THRESHOLD = 0.10;     // °C threshold for stall detection

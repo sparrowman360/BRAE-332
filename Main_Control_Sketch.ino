@@ -39,15 +39,25 @@ const int HEATING_ON = RELAY_ACTIVE_HIGH ? HIGH : LOW;
 const int HEATING_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
 
 // ========== SYSTEM PARAMETERS ==========
-// Temperature setpoint: system will heat when temperature drops below this value
-const float SETPOINT = 25.0;      // Target temperature (°C)
+const float HEATING_SETPOINT = 25.0;      // Heating threshold (°C)
+const float COOLING_SETPOINT = 27.0;      // Cooling threshold (°C)
 
 // Heating control timings
-const long HTIME = 120000;         // Heating duration per cycle (60 seconds in milliseconds)
-const long WAIT_AFTER = 120000;   // Rest/cooling duration after heating (2 minutes in milliseconds)
+const long HTIME = 120000;                // Heating duration per cycle (120 seconds in milliseconds)
+const long WAIT_AFTER = 120000;           // Rest duration after heating (120 seconds in milliseconds)
 
-// Data logging interval: total time between each cycle start
-const long LOG_INTERVAL = 300000; // Total cycle interval (5 minutes in milliseconds)
+// Cooling control timings
+const long COOL_TIME = 60000;              // Cooling duration per cycle (60 seconds in milliseconds)
+const long COOL_WAIT_AFTER = 60000;        // Rest duration after cooling (60 seconds in milliseconds)
+
+// Light schedule timings
+const uint32_t LIGHT_START_DELAY = 3UL * 24UL * 60UL * 60UL; // 3 days in seconds
+const uint32_t LIGHT_ON_DURATION = 18UL * 60UL * 60UL;       // 18 hours in seconds
+const uint32_t LIGHT_OFF_DURATION = 6UL * 60UL * 60UL;       // 6 hours in seconds
+
+// Data logging interval: fixed interval for periodic logs
+const long LOG_INTERVAL = 600000;         // 10 minutes in milliseconds
+const long SENSOR_CHECK_INTERVAL = 5000;  // Sensor threshold check interval while idle or waiting
 
 // Sensor error tracking
 int sensor_error_count = 0;       // Counter for consecutive sensor read failures
@@ -56,8 +66,14 @@ int retryAttempt = 0;             // Current retry attempt for sensor reading
 
 // Global variables for current cycle data (used by tasks)
 DateTime currentNow;
+DateTime startTime;
 float currentTemp;
 float currentHumidity;
+bool heatingActive = false;
+bool coolingActive = false;
+bool heatingWait = false;
+bool coolingWait = false;
+bool lightsOn = false;
 
 // ========== PERIPHERAL OBJECT INITIALIZATION ==========
 RTC_DS3231 rtc;                   // Real-Time Clock object
@@ -67,9 +83,11 @@ Scheduler ts;                     // Task Scheduler for non-blocking operations
 
 // ========== TASK OBJECTS ==========
 Task tRunCycle(0, TASK_FOREVER, &runCycle, &ts, false);
-Task tTurnOff(0, TASK_ONCE, &turnOffRelay, &ts, false);
-Task tLogHeat(0, TASK_ONCE, &logHeatCycle, &ts, false);
-Task tReEnable(0, TASK_ONCE, &reEnableCycle, &ts, false);
+Task tHeatOff(0, TASK_ONCE, &turnOffRelay, &ts, false);
+Task tHeatWait(0, TASK_ONCE, &heatWaitComplete, &ts, false);
+Task tCoolOff(0, TASK_ONCE, &turnOffCooling, &ts, false);
+Task tCoolWait(0, TASK_ONCE, &coolWaitComplete, &ts, false);
+Task tLogPeriodic(0, TASK_FOREVER, &logPeriodic, &ts, false);
 Task tSensorRetry(0, TASK_ONCE, &sensorRetry, &ts, false);
 
 // ========== HELPER FUNCTIONS ==========
@@ -97,6 +115,98 @@ void setPump(bool on) {
   Serial.println(on ? F("ON") : F("OFF"));
 }
 
+void startHeatingCycle() {
+  heatingActive = true;
+  heatingWait = false;
+  setHeatingRelay(true);
+  setPump(false);
+  setFan(false);
+  Serial.println(F("Heating cycle started."));
+  ts.enableDelayedTask(tHeatOff, HTIME);
+  ts.enableDelayedTask(tHeatWait, HTIME + WAIT_AFTER);
+}
+
+void startCoolingCycle() {
+  coolingActive = true;
+  coolingWait = false;
+  setHeatingRelay(false);
+  setPump(true);
+  setFan(true);
+  Serial.println(F("Cooling cycle started."));
+  ts.enableDelayedTask(tCoolOff, COOL_TIME);
+  ts.enableDelayedTask(tCoolWait, COOL_TIME + COOL_WAIT_AFTER);
+}
+
+void turnOffCooling() {
+  setPump(false);
+  setFan(false);
+  coolingActive = false;
+  coolingWait = true;
+  Serial.println(F("Cooling ON time complete, entering cooling rest."));
+}
+
+void heatWaitComplete() {
+  heatingWait = false;
+  Serial.println(F("Heating rest complete, rechecking temperature."));
+  runCycle();
+}
+
+void coolWaitComplete() {
+  coolingWait = false;
+  Serial.println(F("Cooling rest complete, rechecking temperature."));
+  runCycle();
+}
+
+void updateLightState() {
+  if (!startTime.unixtime()) {
+    return;
+  }
+
+  uint32_t elapsedSec = currentNow.unixtime() - startTime.unixtime();
+  if (elapsedSec < LIGHT_START_DELAY) {
+    if (lightsOn) {
+      setLight(false);
+      lightsOn = false;
+    }
+    return;
+  }
+
+  uint32_t cycleSeconds = elapsedSec - LIGHT_START_DELAY;
+  uint32_t cycleLength = LIGHT_ON_DURATION + LIGHT_OFF_DURATION;
+  bool shouldBeOn = (cycleSeconds % cycleLength) < LIGHT_ON_DURATION;
+
+  if (shouldBeOn != lightsOn) {
+    setLight(shouldBeOn);
+    lightsOn = shouldBeOn;
+  }
+}
+
+void logPeriodic() {
+  currentNow = rtc.now();
+  int sensorStatus = shtc3.update();
+  float temp = NAN;
+  float humidity = NAN;
+
+  if (sensorStatus == SHTC3_Status_Nominal) {
+    temp = shtc3.toDegC();
+    humidity = shtc3.toPercent();
+    currentTemp = temp;
+    currentHumidity = humidity;
+  } else {
+    Serial.print(F("Periodic sensor read failed, status="));
+    Serial.println(sensorStatus);
+  }
+
+  updateLightState();
+
+  char action[48];
+  sprintf(action, "Heat:%s,Cool:%s,Light:%s",
+          heatingActive ? "ON" : "OFF",
+          coolingActive ? "ON" : "OFF",
+          lightsOn ? "ON" : "OFF");
+  logToSD(currentNow, temp, humidity, action);
+}
+
 void printTimestamp(Print &out, const DateTime &n) {
   out.print(n.year());
   out.print(",");
@@ -114,11 +224,9 @@ void printTimestamp(Print &out, const DateTime &n) {
 // ========== TASK FUNCTIONS FOR SCHEDULER ==========
 void turnOffRelay() {
   setHeatingRelay(false);
+  heatingActive = false;
+  heatingWait = true;
   Serial.println(F("Heat OFF"));
-}
-
-void logHeatCycle() {
-  logToSD(currentNow, currentTemp, currentHumidity, "HEAT_CYCLE");
 }
 
 void reEnableCycle() {
@@ -130,26 +238,25 @@ void reEnableCycle() {
 void processSensorData() {
   // ========== HEATING DECISION LOGIC ==========
   // Check if current temperature is below setpoint
-  if (currentTemp < SETPOINT) {
+  if (heatingActive || coolingActive || heatingWait || coolingWait) {
+    Serial.println(F("Cycle busy, no new action taken."));
+    return;
+  }
+
+  if (currentTemp < HEATING_SETPOINT) {
     Serial.print(F("Heat ON: "));
     Serial.println(currentTemp);
-
-    // Turn on relay for heating
-    setHeatingRelay(true);
-
-    // Schedule to turn off relay after HTIME
-    ts.enableDelayedTask(tTurnOff, HTIME);
-
-    // Schedule to log heat cycle after HTIME + WAIT_AFTER
-    ts.enableDelayedTask(tLogHeat, HTIME + WAIT_AFTER);
-
-  } else {
-    // Temperature is above setpoint, no heating needed
-    Serial.print(F("OK: "));
+    startHeatingCycle();
+    logToSD(currentNow, currentTemp, currentHumidity, "HEATING_ON");
+  } else if (currentTemp > COOLING_SETPOINT) {
+    Serial.print(F("Cooling ON: "));
     Serial.println(currentTemp);
-    
-    // Log that heating was not needed
-    logToSD(currentNow, currentTemp, currentHumidity, "OK");
+    startCoolingCycle();
+    logToSD(currentNow, currentTemp, currentHumidity, "COOLING_ON");
+  } else {
+    Serial.print(F("Idle: "));
+    Serial.println(currentTemp);
+    logToSD(currentNow, currentTemp, currentHumidity, "IDLE");
   }
 
   // ========== CYCLE COMPLETION ==========
@@ -190,6 +297,7 @@ void sensorRetry() {
 void runCycle() {
   // Get current date/time from RTC
   currentNow = rtc.now();
+  updateLightState();
 
   // ========== SENSOR READING ==========
   // Attempt to read temperature and humidity from SHTC3 sensor
@@ -236,6 +344,8 @@ void setup() {
     while (1);
   }
   Serial.println(F("RTC OK"));
+  startTime = rtc.now();
+  lightsOn = false;
 
   // ========== INITIALIZE SD CARD ==========
   if (!SD.begin(CS_PIN)) {
@@ -271,11 +381,14 @@ void setup() {
 
   // ========== SETUP TASK SCHEDULER ==========
   ts.addTask(tRunCycle);
-  ts.addTask(tTurnOff);
-  ts.addTask(tLogHeat);
-  ts.addTask(tReEnable);
+  ts.addTask(tHeatOff);
+  ts.addTask(tHeatWait);
+  ts.addTask(tCoolOff);
+  ts.addTask(tCoolWait);
+  ts.addTask(tLogPeriodic);
   ts.addTask(tSensorRetry);
-  ts.enablePeriodicTask(tRunCycle, LOG_INTERVAL);
+  ts.enablePeriodicTask(tRunCycle, SENSOR_CHECK_INTERVAL);
+  ts.enablePeriodicTask(tLogPeriodic, LOG_INTERVAL);
 }
 
 // ========== MAIN LOOP ==========
