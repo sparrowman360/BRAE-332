@@ -23,6 +23,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <Wire.h>
+#include <EEPROM.h>
 #include "RTClib.h"
 #include "SparkFun_SHTC3.h"
 
@@ -38,7 +39,7 @@ const int HEATING_ON = RELAY_ACTIVE_HIGH ? HIGH : LOW;
 const int HEATING_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
 
 // ========== SYSTEM PARAMETERS ==========
-const float HEATING_SETPOINT = 25.0;      // Heating threshold (°C)
+const float HEATING_SETPOINT = 25.5;      // Heating threshold (°C)
 const float COOLING_SETPOINT = 27.0;      // Cooling threshold (°C)
 
 const long HTIME = 30000;                // Heating ON duration 30sec
@@ -54,6 +55,13 @@ const long LOG_INTERVAL = 600000;         // 10 minutes in milliseconds
 const long SENSOR_CHECK_INTERVAL = 5000;  // Sensor check interval while idle/waiting
 
 const int MAX_ERROR_ATTEMPTS = 3;
+const int SD_OPEN_RETRY_LIMIT = 3;
+const long SD_OPEN_RETRY_DELAY = 250;     // milliseconds between retry attempts
+const int MAX_SD_ERRORS = 5;
+
+const uint16_t LIGHT_START_SIGNATURE = 0xA5A5;
+const int EEPROM_LIGHT_START_SIGNATURE_ADDR = 0;
+const int EEPROM_LIGHT_START_TIME_ADDR = EEPROM_LIGHT_START_SIGNATURE_ADDR + sizeof(uint16_t);
 
 // ========== STATE VARIABLES ==========
 RTC_DS3231 rtc;
@@ -73,6 +81,7 @@ bool coolingWait = false;
 bool lightsOn = false;
 int sensor_error_count = 0;
 int retryAttempt = 0;
+int sdErrorCount = 0;
 
 unsigned long nextSensorCheckTime = 0;
 unsigned long nextLogTime = 0;
@@ -116,11 +125,53 @@ void printTimestamp(Print &out, const DateTime &n) {
   out.print(n.second());
 }
 
-void logToSD(DateTime n, float t, float h, const char* act) {
-  dataFile = SD.open("datalog.csv", FILE_WRITE);
-  if (!dataFile) {
-    Serial.println(F("Log error"));
-    return;
+bool openLogFile(File &fileHandle) {
+  for (int attempt = 1; attempt <= SD_OPEN_RETRY_LIMIT; attempt++) {
+    fileHandle = SD.open("datalog.csv", FILE_WRITE);
+    if (fileHandle) {
+      return true;
+    }
+    Serial.print(F("SD open retry "));
+    Serial.print(attempt);
+    Serial.println(F(" failed"));
+    delay(SD_OPEN_RETRY_DELAY);
+  }
+  return false;
+}
+
+void saveLightStartTime(uint32_t unixTime) {
+  uint16_t signature = LIGHT_START_SIGNATURE;
+  EEPROM.put(EEPROM_LIGHT_START_SIGNATURE_ADDR, signature);
+  EEPROM.put(EEPROM_LIGHT_START_TIME_ADDR, unixTime);
+  Serial.print(F("Saved light start epoch: "));
+  Serial.println(unixTime);
+}
+
+bool loadSavedLightStartTime(uint32_t &unixTime) {
+  uint16_t signature;
+  EEPROM.get(EEPROM_LIGHT_START_SIGNATURE_ADDR, signature);
+  if (signature != LIGHT_START_SIGNATURE) {
+    return false;
+  }
+  EEPROM.get(EEPROM_LIGHT_START_TIME_ADDR, unixTime);
+  return unixTime != 0;
+}
+
+bool logToSD(DateTime n, float t, float h, const char* act) {
+  if (!openLogFile(dataFile)) {
+    Serial.println(F("Log error: unable to open datalog.csv"));
+    sdErrorCount++;
+    Serial.print(F("SD error count: "));
+    Serial.println(sdErrorCount);
+    if (sdErrorCount >= MAX_SD_ERRORS) {
+      Serial.println(F("SD card unstable: too many log failures."));
+    }
+    if (!SD.begin(CS_PIN)) {
+      Serial.println(F("SD reinit failed"));
+    } else {
+      Serial.println(F("SD reinit succeeded"));
+    }
+    return false;
   }
 
   printTimestamp(dataFile, n);
@@ -132,18 +183,27 @@ void logToSD(DateTime n, float t, float h, const char* act) {
   dataFile.println(act);
   dataFile.close();
 
+  sdErrorCount = 0;
   Serial.print(F("LOG: "));
   if (!isnan(t)) {
     Serial.print(t);
     Serial.print(F("C "));
   }
   Serial.println(act);
+  return true;
 }
 
 void updateLightState() {
   if (!startTime.unixtime()) return;
   currentNow = rtc.now();
-  uint32_t elapsedSec = currentNow.unixtime() - startTime.unixtime();
+  uint32_t currentUnix = currentNow.unixtime();
+  uint32_t startUnix = startTime.unixtime();
+  if (currentUnix < startUnix) {
+    Serial.println(F("WARNING: RTC time is earlier than saved light start time."));
+    return;
+  }
+
+  uint32_t elapsedSec = currentUnix - startUnix;
 
   if (elapsedSec < LIGHT_START_DELAY) {
     if (lightsOn) {
@@ -305,7 +365,19 @@ void setup() {
     while (1);
   }
   Serial.println(F("RTC OK"));
-  startTime = rtc.now();
+
+  uint32_t savedLightStartEpoch;
+  if (loadSavedLightStartTime(savedLightStartEpoch)) {
+    startTime = DateTime(savedLightStartEpoch);
+    Serial.print(F("Loaded saved light reference: "));
+    Serial.println(savedLightStartEpoch);
+  } else {
+    startTime = rtc.now();
+    saveLightStartTime(startTime.unixtime());
+    Serial.print(F("Initialized light reference: "));
+    Serial.println(startTime.unixtime());
+  }
+
   lightsOn = false;
 
   if (!SD.begin(CS_PIN)) {
