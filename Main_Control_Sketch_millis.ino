@@ -1,9 +1,6 @@
 /*
  * BRAE-332: Heat Control System with Data Logging (millis scheduler)
  * ================================================================
- * This duplicate sketch uses millis()-based scheduling instead of
- * TaskScheduler so you can compare behavior and continue working on
- * the original program separately.
  *
  * Hardware:
  * - Arduino microcontroller
@@ -11,6 +8,16 @@
  * - SHTC3 temperature/humidity sensor via I2C
  * - SD card module via SPI, CS pin 10
  * - Relay modules for heating, fan, pump, and light
+  *
+  * Libraries (READ ME):
+  * - SPI.h for SD card communication
+  * - SD.h for SD card file handling
+  * - Wire.h for I2C communication
+  * - RTClib.h for RTC handling
+  * - SparkFun_SHTC3.h for SHTC3 sensor handling
+  * Libraries can be installed via Arduino Library Manager in the Arduino IDE.
+  * Go to Sketch -> Include Library -> Manage Libraries, then search for the above listed libraries and install them. 
+  * The program will not work without  these libraries installed. 
  */
 
 #include <SPI.h>
@@ -34,10 +41,10 @@ const int HEATING_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
 const float HEATING_SETPOINT = 25.0;      // Heating threshold (°C)
 const float COOLING_SETPOINT = 27.0;      // Cooling threshold (°C)
 
-const long HTIME = 120000;                // Heating ON duration (ms)
-const long WAIT_AFTER = 120000;           // Heating rest duration (ms)
-const long COOL_TIME = 60000;             // Cooling ON duration (ms)
-const long COOL_WAIT_AFTER = 60000;       // Cooling rest duration (ms)
+const long HTIME = 30000;                // Heating ON duration 30sec
+const long WAIT_AFTER = 60000;           // Heating rest duration 1min
+const long COOL_TIME = 60000;             // Cooling ON duration 1min
+const long COOL_WAIT_AFTER = 60000;       // Cooling rest duration 1min
 
 const uint32_t LIGHT_START_DELAY = 3UL * 24UL * 60UL * 60UL; // 3 days in seconds
 const uint32_t LIGHT_ON_DURATION = 18UL * 60UL * 60UL;       // 18 hours in seconds
@@ -69,6 +76,7 @@ int retryAttempt = 0;
 
 unsigned long nextSensorCheckTime = 0;
 unsigned long nextLogTime = 0;
+unsigned long nextSerialPrintTime = 0;
 unsigned long heatEndTime = 0;
 unsigned long heatWaitEndTime = 0;
 unsigned long coolEndTime = 0;
@@ -204,7 +212,6 @@ void processSensorData() {
     Serial.println(sensorStatus);
     retryAttempt = 1;
     sensor_error_count++;
-    logToSD(currentNow, NAN, NAN, "ERROR");
     nextSensorCheckTime = millis() + 200;
     return;
   }
@@ -217,19 +224,41 @@ void processSensorData() {
     Serial.print(F("Heat ON: "));
     Serial.println(currentTemp);
     startHeatingCycle();
-    logToSD(currentNow, currentTemp, currentHumidity, "HEATING_ON");
   } else if (currentTemp > COOLING_SETPOINT) {
     Serial.print(F("Cooling ON: "));
     Serial.println(currentTemp);
     startCoolingCycle();
-    logToSD(currentNow, currentTemp, currentHumidity, "COOLING_ON");
   } else {
     Serial.print(F("Idle: "));
     Serial.println(currentTemp);
-    logToSD(currentNow, currentTemp, currentHumidity, "IDLE");
   }
 
   Serial.println(F("Cycle done"));
+}
+
+void printSensorStatus() {
+  currentNow = rtc.now();
+  int sensorStatus = shtc3.update();
+
+  if (sensorStatus == SHTC3_Status_Nominal) {
+    currentTemp = shtc3.toDegC();
+    currentHumidity = shtc3.toPercent();
+    Serial.print(F("Temp: "));
+    Serial.print(currentTemp);
+    Serial.print(F(" C Humidity: "));
+    Serial.print(currentHumidity);
+    Serial.print(F(" %"));
+  } else {
+    Serial.print(F("Sensor read failed, status="));
+    Serial.print(sensorStatus);
+  }
+
+  Serial.print(F(" Heat:"));
+  Serial.print(heatingActive ? F("ON") : F("OFF"));
+  Serial.print(F(" Cool:"));
+  Serial.print(coolingActive ? F("ON") : F("OFF"));
+  Serial.print(F(" Light:"));
+  Serial.println(lightsOn ? F("ON") : F("OFF"));
 }
 
 void logPeriodic() {
@@ -307,6 +336,7 @@ void setup() {
 
   Serial.println(F("Setup complete."));
   nextSensorCheckTime = millis();
+  nextSerialPrintTime = millis();
   nextLogTime = millis();
 }
 
@@ -338,6 +368,11 @@ void loop() {
   if (!heatingActive && !coolingActive && !heatingWait && !coolingWait && now >= nextSensorCheckTime) {
     processSensorData();
     nextSensorCheckTime = now + SENSOR_CHECK_INTERVAL;
+  }
+
+  if (now >= nextSerialPrintTime) {
+    printSensorStatus();
+    nextSerialPrintTime = now + SENSOR_CHECK_INTERVAL;
   }
 
   if (now >= nextLogTime) {
