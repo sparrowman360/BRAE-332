@@ -39,16 +39,17 @@ const int HEATING_ON = RELAY_ACTIVE_HIGH ? HIGH : LOW;
 const int HEATING_OFF = RELAY_ACTIVE_HIGH ? LOW : HIGH;
 
 // ========== SYSTEM PARAMETERS ==========
-const float HEATING_SETPOINT = 25.5;      // Heating threshold after the first 3-day warmup period (°C)
-const float INITIAL_HEATING_SETPOINT = 27.25; // Heating threshold for the initial 3-day warmup period (°C)
-const float COOLING_SETPOINT = 27.0;      // Cooling threshold (°C)
+const float HEATING_SETPOINT = 25.5;      // Heating threshold after the first 24-hour warmup period (°C)
+const float INITIAL_HEATING_SETPOINT = 27.25; // Heating threshold for the initial 24-hour warmup period (°C)
+const float COOLING_SETPOINT = 27.0;      // Cooling threshold after the first 24-hour warmup period (°C)
+const float INITIAL_COOLING_SETPOINT = 29.0; // Cooling threshold for the initial 24-hour warmup period (°C)
 
 const long HTIME = 30000;                // Heating ON duration 30sec
 const long WAIT_AFTER = 60000;           // Heating rest duration 1min
 const long COOL_TIME = 60000;             // Cooling ON duration 1min
 const long COOL_WAIT_AFTER = 60000;       // Cooling rest duration 1min
 
-const uint32_t LIGHT_START_DELAY = 3UL * 24UL * 60UL * 60UL; // 3 days in seconds
+const uint32_t LIGHT_START_DELAY = 1UL * 24UL * 60UL * 60UL; // 24 hours in seconds
 const uint32_t LIGHT_ON_DURATION = 18UL * 60UL * 60UL;       // 18 hours in seconds
 const uint32_t LIGHT_OFF_DURATION = 6UL * 60UL * 60UL;       // 6 hours in seconds
 
@@ -239,6 +240,22 @@ float getCurrentHeatingSetpoint() {
   return (elapsedSec < LIGHT_START_DELAY) ? INITIAL_HEATING_SETPOINT : HEATING_SETPOINT;
 }
 
+float getCurrentCoolingSetpoint() {
+  if (!startTime.unixtime()) {
+    return COOLING_SETPOINT;
+  }
+
+  currentNow = rtc.now();
+  uint32_t currentUnix = currentNow.unixtime();
+  uint32_t startUnix = startTime.unixtime();
+  if (currentUnix < startUnix) {
+    return COOLING_SETPOINT;
+  }
+
+  uint32_t elapsedSec = currentUnix - startUnix;
+  return (elapsedSec < LIGHT_START_DELAY) ? INITIAL_COOLING_SETPOINT : COOLING_SETPOINT;
+}
+
 void turnOffRelay() {
   setHeatingRelay(false);
   heatingActive = false;
@@ -297,16 +314,19 @@ void processSensorData() {
   currentTemp = shtc3.toDegC();
   currentHumidity = shtc3.toPercent();
   float activeHeatingSetpoint = getCurrentHeatingSetpoint();
+  float activeCoolingSetpoint = getCurrentCoolingSetpoint();
 
   if (currentTemp < activeHeatingSetpoint) {
     Serial.print(F("Heat ON: "));
     Serial.print(currentTemp);
-    Serial.print(F(" <= setpoint "));
+    Serial.print(F(" <= heat setpoint "));
     Serial.println(activeHeatingSetpoint);
     startHeatingCycle();
-  } else if (currentTemp > COOLING_SETPOINT) {
+  } else if (currentTemp > activeCoolingSetpoint) {
     Serial.print(F("Cooling ON: "));
-    Serial.println(currentTemp);
+    Serial.print(currentTemp);
+    Serial.print(F(" >= cool setpoint "));
+    Serial.println(activeCoolingSetpoint);
     startCoolingCycle();
   } else {
     Serial.print(F("Idle: "));
